@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,6 +7,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 class CryptoAnalyzer:
     def __init__(self, api_key, api_secret, num_threads=4):
@@ -40,7 +40,7 @@ class CryptoAnalyzer:
                 )
                 time.sleep(0.5)  # Rate limiting
 
-            if len(klines) < lookback_days * 0.95:  # Allow for some missing days (weekends, holidays)
+            if len(klines) < lookback_days * 0.95:  # Allow for some missing days
                 print(f"Skipping {symbol} - Insufficient data: {len(klines)} days")
                 return None
 
@@ -130,18 +130,15 @@ class CryptoAnalyzer:
 
         with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
             while processed_count < required_coins and symbols:
-                # Take next batch of symbols to process
                 batch_size = min(required_coins - processed_count, len(symbols))
                 current_batch = symbols[:batch_size]
-                symbols = symbols[batch_size:]  # Remove processed symbols
+                symbols = symbols[batch_size:]
 
-                # Submit batch for processing
                 future_to_symbol = {
                     executor.submit(self.process_symbol, symbol, lookback_days): symbol
                     for symbol in current_batch
                 }
 
-                # Process completed tasks
                 for future in as_completed(future_to_symbol):
                     result = future.result()
                     if result is not None:
@@ -154,32 +151,12 @@ class CryptoAnalyzer:
                     print(f"\nWarning: Only found {processed_count} valid coins with {lookback_days} days of data")
                     break
 
-        # Convert to DataFrame and sort
         results_df = pd.DataFrame(results)
         if not results_df.empty:
             results_df = results_df.sort_values('percent_diff')
 
         return results_df
 
-
-# Usage example
-if __name__ == "__main__":
-    # Create analyzer with 4 threads
-    analyzer = CryptoAnalyzer(num_threads=4)
-
-    # Time the analysis
-    start_time = time.time()
-
-    print("Running multi-threaded analysis...")
-    results = analyzer.analyze_symbols(lookback_days=270, required_coins=200)
-
-    end_time = time.time()
-    execution_time = end_time - start_time
-
-    print(f"\nAnalysis completed in {execution_time:.2f} seconds")
-    print("\nResults (sorted by percentage difference from POC):")
-    pd.set_option('display.float_format', lambda x: '%.4f' % x)
-    print(results[['symbol', 'current_price', 'poc', 'percent_diff', 'days_of_data', 'price_category']])
 
 # Streamlit interface
 st.set_page_config(page_title="Crypto POC Analyzer", layout="wide")
@@ -212,95 +189,85 @@ This tool analyzes cryptocurrency prices on Binance and calculates the Point of 
 for each trading pair. It only includes coins with complete historical data for the specified period.
 """)
 
+# Check for API configuration before allowing analysis
 if not st.session_state.api_configured:
     st.warning(
         "Please configure your Binance API keys in the sidebar first. You can create API keys in your Binance account settings.")
     st.info("Note: The API keys are never stored and are only used for the current session.")
-    st.stop()
+else:
+    if st.button("Run Analysis"):
+        try:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-if st.button("Run Analysis"):
-    try:
-        # Create progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        # Initialize analyzer with API keys
-        analyzer = CryptoAnalyzer(
-            api_key=st.session_state.api_key,
-            api_secret=st.session_state.api_secret,
-            num_threads=num_threads
-        )
-
-        # Start time
-        start_time = time.time()
-
-        # Run analysis with progress updates
-        status_text.text("Fetching top symbols...")
-        results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins)
-
-        # Calculate execution time
-        execution_time = time.time() - start_time
-
-        # Update progress
-        progress_bar.progress(100)
-        status_text.text(f"Analysis completed in {execution_time:.2f} seconds")
-
-        # Display results
-        if not results.empty:
-            st.header("Results")
-
-            # Format the DataFrame for display
-            display_df = results[['symbol', 'current_price', 'poc', 'percent_diff', 'days_of_data', 'price_category']]
-            display_df = display_df.round({
-                'current_price': 4,
-                'poc': 4,
-                'percent_diff': 2
-            })
-
-
-            # Add color highlighting based on percent difference
-            def highlight_percent_diff(val):
-                if isinstance(val, float):
-                    color = 'red' if val < 0 else 'green'
-                    return f'color: {color}'
-                return ''
-
-
-            styled_df = display_df.style.applymap(
-                highlight_percent_diff,
-                subset=['percent_diff']
+            # Initialize analyzer with API keys
+            analyzer = CryptoAnalyzer(
+                api_key=st.session_state.api_key,
+                api_secret=st.session_state.api_secret,
+                num_threads=num_threads
             )
 
-            # Display the table
-            st.dataframe(styled_df, use_container_width=True)
+            start_time = time.time()
 
-            # Add download button
-            csv = display_df.to_csv(index=False)
-            st.download_button(
-                label="Download results as CSV",
-                data=csv,
-                file_name=f"crypto_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
+            status_text.text("Fetching top symbols...")
+            results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins)
 
-            # Add summary statistics
-            st.header("Summary Statistics")
-            col1, col2, col3 = st.columns(3)
+            execution_time = time.time() - start_time
 
-            with col1:
-                st.metric("Average % Difference", f"{results['percent_diff'].mean():.2f}%")
-            with col2:
-                st.metric("Most Undervalued", f"{results['percent_diff'].min():.2f}%")
-            with col3:
-                st.metric("Most Overvalued", f"{results['percent_diff'].max():.2f}%")
+            progress_bar.progress(100)
+            status_text.text(f"Analysis completed in {execution_time:.2f} seconds")
 
-        else:
-            st.error("No results found. Try adjusting the parameters.")
+            if not results.empty:
+                st.header("Results")
 
-    except BinanceAPIException as e:
-        st.error(f"Binance API Error: {str(e)}")
-        if "Invalid API-key" in str(e):
-            st.info(
-                "Please check if your API keys are correct and have the necessary permissions (read-only is sufficient).")
-    except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
+                display_df = results[
+                    ['symbol', 'current_price', 'poc', 'percent_diff', 'days_of_data', 'price_category']]
+                display_df = display_df.round({
+                    'current_price': 4,
+                    'poc': 4,
+                    'percent_diff': 2
+                })
+
+
+                def highlight_percent_diff(val):
+                    if isinstance(val, float):
+                        color = 'red' if val < 0 else 'green'
+                        return f'color: {color}'
+                    return ''
+
+
+                styled_df = display_df.style.applymap(
+                    highlight_percent_diff,
+                    subset=['percent_diff']
+                )
+
+                st.dataframe(styled_df, use_container_width=True)
+
+                csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="Download results as CSV",
+                    data=csv,
+                    file_name=f"crypto_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+
+                st.header("Summary Statistics")
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.metric("Average % Difference", f"{results['percent_diff'].mean():.2f}%")
+                with col2:
+                    st.metric("Most Undervalued", f"{results['percent_diff'].min():.2f}%")
+                with col3:
+                    st.metric("Most Overvalued", f"{results['percent_diff'].max():.2f}%")
+
+            else:
+                st.error("No results found. Try adjusting the parameters.")
+
+        except BinanceAPIException as e:
+            st.error(f"Binance API Error: {str(e)}")
+            if "Invalid API-key" in str(e):
+                st.info(
+                    "Please check if your API keys are correct and have the necessary permissions (read-only is sufficient).")
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
