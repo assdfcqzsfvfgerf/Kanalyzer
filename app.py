@@ -29,7 +29,7 @@ class ExchangeAdapter:
     def get_top_symbols(self, limit=200):
         raise NotImplementedError
 
-    def get_historical_data(self, symbol, interval='1d', lookback_days=270):
+    def get_historical_data(self, symbol, interval='1h', lookback_days=270):
         raise NotImplementedError
 
 class BinanceAdapter(ExchangeAdapter):
@@ -47,7 +47,7 @@ class BinanceAdapter(ExchangeAdapter):
         # Multiply limit by 2 to allow filtering later
         return [pair['symbol'] for pair in sorted_pairs[:limit * 2]]
 
-    def get_historical_data(self, symbol, interval='1d', lookback_days=270):
+    def get_historical_data(self, symbol, interval='1h', lookback_days=270):
         try:
             start_time = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
             with self.api_lock:
@@ -58,7 +58,7 @@ class BinanceAdapter(ExchangeAdapter):
                     limit=1000
                 )
                 time.sleep(0.5)
-            if len(klines) < lookback_days * 0.95:
+            if len(klines) < lookback_days * 22:  # Approximate number of 1h candles per day
                 return None
             df = pd.DataFrame(klines, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -101,15 +101,19 @@ class CCXTAdapter(ExchangeAdapter):
         )
         return sorted_pairs[:limit * 2]
 
-    def get_historical_data(self, symbol, interval='1d', lookback_days=270):
+    def get_historical_data(self, symbol, interval='1h', lookback_days=270):
         try:
-            timeframe = '1d'  # CCXT uses its own timeframes
+            timeframe = '1h'  # Using 1h timeframe as requested
             since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
             with self.api_lock:
                 ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
                 time.sleep(0.5)
-            if len(ohlcv) < lookback_days * 0.95:
+            
+            # For 1h timeframe, check if we have enough hourly candles
+            # Approximate 24 hours per day
+            if len(ohlcv) < lookback_days * 22:  # Using 22 instead of 24 to allow for missing candles
                 return None
+                
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
@@ -130,7 +134,7 @@ class CryptoAnalyzer:
         if self.progress_callback:
             self.progress_callback(progress)
 
-    def analyze_symbols(self, lookback_days=270, required_coins=200):
+    def analyze_symbols(self, lookback_days=270, required_coins=200, interval='1h'):
         symbols = self.exchange.get_top_symbols(limit=required_coins)
         results = []
         processed_count = 0
@@ -142,7 +146,7 @@ class CryptoAnalyzer:
                 batch_size = min(required_coins - processed_count, len(symbols))
                 current_batch = symbols[:batch_size]
                 symbols = symbols[batch_size:]
-                future_to_symbol = {executor.submit(self.process_symbol, symbol, lookback_days): symbol for symbol in current_batch}
+                future_to_symbol = {executor.submit(self.process_symbol, symbol, lookback_days, interval): symbol for symbol in current_batch}
                 for future in as_completed(future_to_symbol):
                     try:
                         result = future.result()
@@ -165,25 +169,35 @@ class CryptoAnalyzer:
             results_df = results_df.sort_values('percent_diff')
         return results_df
 
-    def process_symbol(self, symbol, lookback_days=270):
+    def process_symbol(self, symbol, lookback_days=270, interval='1h'):
         try:
             print(f"Processing {symbol}...")
-            df = self.exchange.get_historical_data(symbol, lookback_days=lookback_days)
+            df = self.exchange.get_historical_data(symbol, interval=interval, lookback_days=lookback_days)
             if df is None:
                 return None
+                
+            # Calculate POC
             poc = self.calculate_poc(df)
             if poc is None:
                 return None
+                
+            # Calculate 200 EMA
+            df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+            current_ema = df['ema_200'].iloc[-1]
+            
             current_price = float(df['close'].iloc[-1])
             percent_diff = ((current_price - poc) / poc) * 100
+            ema_percent_diff = ((current_price - current_ema) / current_ema) * 100
+            
             return {
                 'symbol': symbol,
                 'current_price': current_price,
                 'poc': poc,
                 'percent_diff': percent_diff,
+                'ema_200': current_ema,
+                'ema_percent_diff': ema_percent_diff,
                 'volume_24h': float(df['volume'].iloc[-1]),
-                'price_category': 'High' if current_price >= 100 else 'Mid' if current_price >= 1 else 'Low',
-                'days_of_data': len(df)
+                'price_category': 'High' if current_price >= 100 else 'Mid' if current_price >= 1 else 'Low'
             }
         except Exception as e:
             print(f"Error analyzing {symbol}: {e}")
@@ -221,8 +235,9 @@ st.title("Cryptocurrency Point of Control (POC) Analyzer")
 
 # Add exchange selection
 st.sidebar.header("Exchange Configuration")
-exchange_options = ['binance', 'binanceus'] + sorted(ccxt.exchanges)
-selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options)
+exchange_options = ['cryptocom', 'binance', 'binanceus'] + sorted([ex for ex in ccxt.exchanges if ex != 'cryptocom'])
+# Setting cryptocom as default
+selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options, index=0)
 
 # API Configuration
 st.sidebar.header("API Configuration")
@@ -240,14 +255,29 @@ if api_key and api_secret:
 
 # Analysis parameters
 st.sidebar.header("Analysis Parameters")
+
+# Calculate and display the date we're going back to
+today = datetime.now().date()
 lookback_days = st.sidebar.slider("Lookback Days", min_value=30, max_value=365, value=270)
+lookback_date = today - timedelta(days=lookback_days)
+st.sidebar.text(f"Analysis from {lookback_date.strftime('%Y-%m-%d')} to {today.strftime('%Y-%m-%d')}")
+
+# Add date selection via calendar
+st.sidebar.subheader("Or select specific start date:")
+selected_date = st.sidebar.date_input("Start Date", value=lookback_date, max_value=today - timedelta(days=1))
+# Recalculate lookback days if date is selected
+if selected_date:
+    lookback_days = (today - selected_date).days
+    st.sidebar.text(f"Corresponds to {lookback_days} lookback days")
+
 num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, value=50)
 num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=4)
 
 # Main content
 st.write("""
 This tool analyzes cryptocurrency prices and calculates the Point of Control (POC) 
-for each trading pair. It only includes coins with complete historical data for the specified period.
+for each trading pair using 1-hour timeframe data. It also calculates the 200 EMA 
+for comparison. Only coins with complete historical data for the specified period are included.
 """)
 
 # Run analysis
@@ -278,30 +308,40 @@ if st.button("Run Analysis"):
 
         start_time = time.time()
         status_text.text("Starting analysis...")
-        results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins)
+        # Use 1h timeframe for analysis
+        results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins, interval='1h')
         execution_time = time.time() - start_time
         status_text.text(f"Analysis completed in {execution_time:.2f} seconds")
 
         if not results.empty:
             st.header("Results")
             display_df = results[
-                ['symbol', 'current_price', 'poc', 'percent_diff', 'days_of_data', 'price_category']
+                ['symbol', 'current_price', 'poc', 'percent_diff', 'ema_200', 'ema_percent_diff', 'price_category']
             ]
             display_df = display_df.round({
                 'current_price': 4,
                 'poc': 4,
-                'percent_diff': 2
+                'percent_diff': 2,
+                'ema_200': 4,
+                'ema_percent_diff': 2
+            })
+            
+            # Rename columns for better clarity
+            display_df = display_df.rename(columns={
+                'percent_diff': 'POC Diff %',
+                'ema_percent_diff': 'EMA Diff %',
+                'ema_200': '200 EMA'
             })
 
-            def highlight_percent_diff(val):
+            def highlight_diff(val):
                 if isinstance(val, float):
                     color = 'red' if val < 0 else 'green'
                     return f'color: {color}'
                 return ''
 
             styled_df = display_df.style.applymap(
-                highlight_percent_diff,
-                subset=['percent_diff']
+                highlight_diff,
+                subset=['POC Diff %', 'EMA Diff %']
             )
 
             st.dataframe(styled_df, use_container_width=True)
@@ -315,14 +355,16 @@ if st.button("Run Analysis"):
             )
 
             st.header("Summary Statistics")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
             with col1:
-                st.metric("Average % Difference", f"{results['percent_diff'].mean():.2f}%")
+                st.metric("Avg POC Diff", f"{results['percent_diff'].mean():.2f}%")
             with col2:
-                st.metric("Most Undervalued", f"{results['percent_diff'].min():.2f}%")
+                st.metric("Most Undervalued (POC)", f"{results['percent_diff'].min():.2f}%")
             with col3:
-                st.metric("Most Overvalued", f"{results['percent_diff'].max():.2f}%")
+                st.metric("Avg EMA Diff", f"{results['ema_percent_diff'].mean():.2f}%")
+            with col4:
+                st.metric("Most Undervalued (EMA)", f"{results['ema_percent_diff'].min():.2f}%")
         else:
             st.error("No results found. Try adjusting the parameters.")
     except BinanceAPIException as e:
