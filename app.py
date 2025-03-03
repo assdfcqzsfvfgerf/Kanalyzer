@@ -58,7 +58,7 @@ class BinanceAdapter(ExchangeAdapter):
                     limit=1000
                 )
                 time.sleep(0.5)
-            if len(klines) < lookback_days * 22:  # Approximate number of 1h candles per day
+            if len(klines) < lookback_days * 0.99:  # Approximate number of 1h candles per day
                 return None
             df = pd.DataFrame(klines, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -111,7 +111,7 @@ class CCXTAdapter(ExchangeAdapter):
             
             # For 1h timeframe, check if we have enough hourly candles
             # Approximate 24 hours per day
-            if len(ohlcv) < lookback_days * 22:  # Using 22 instead of 24 to allow for missing candles
+            if len(ohlcv) < lookback_days * 0.99:  # Using 22 instead of 24 to allow for missing candles
                 return None
                 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -270,8 +270,8 @@ if selected_date:
     lookback_days = (today - selected_date).days
     st.sidebar.text(f"Corresponds to {lookback_days} lookback days")
 
-num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, value=50)
-num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=4)
+num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, value=150)
+num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=2)
 
 # Main content
 st.write("""
