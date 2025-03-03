@@ -305,7 +305,7 @@ if st.button("Run Analysis"):
         execution_time = time.time() - start_time
         status_text.text(f"Analysis completed in {execution_time:.2f} seconds")
 
-      if not results.empty:
+        if not results.empty:
             st.header("Results")
             display_df = results[
                 ['symbol', 'current_price', 'poc', 'percent_diff', 'ema_200', 'ema_percent_diff', 'price_category']
