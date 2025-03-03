@@ -58,8 +58,16 @@ class BinanceAdapter(ExchangeAdapter):
                     limit=1000
                 )
                 time.sleep(0.5)
-            if len(klines) < lookback_days * 0.99:  # Approximate number of 1h candles per day
+            
+            # For 1h timeframe, we need to be more lenient with data requirements
+            # With 24 hours per day, we need approximately 24 * lookback_days candles
+            # But let's be more lenient and require at least 22 hours per day
+            min_required_candles = lookback_days * 22
+            
+            if len(klines) < min_required_candles:
+                print(f"Not enough data for {symbol}: {len(klines)} candles, required {min_required_candles}")
                 return None
+                
             df = pd.DataFrame(klines, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_volume', 'trades', 'taker_buy_base',
@@ -85,37 +93,127 @@ class CCXTAdapter(ExchangeAdapter):
         self.exchange = exchange_class({
             'apiKey': api_key,
             'secret': api_secret,
-            'enableRateLimit': True
+            'enableRateLimit': True,
+            # Add timeout to prevent hanging
+            'timeout': 30000,
+            # Add retry count
+            'retry_count': 3
         })
-        self.base_currency = 'USDT'
+        # For cryptocom specifically
+        if exchange_name == 'cryptocom':
+            self.base_currency = '/USDT'
+        else:
+            self.base_currency = 'USDT'
 
     def get_top_symbols(self, limit=200):
-        with self.api_lock:
-            tickers = self.exchange.fetch_tickers()
-            time.sleep(0.5)
-        usdt_pairs = [symbol for symbol in tickers.keys() if symbol.endswith(self.base_currency)]
-        sorted_pairs = sorted(
-            usdt_pairs,
-            key=lambda x: float(tickers[x]['quoteVolume'] or 0),
-            reverse=True
-        )
-        return sorted_pairs[:limit * 2]
+        try:
+            with self.api_lock:
+                # Use fetch_markets which is often more reliable than fetch_tickers
+                markets = self.exchange.fetch_markets()
+                time.sleep(1)  # Increase delay to avoid rate limits
+                
+            # Handle different exchange formats
+            if isinstance(self.base_currency, str) and self.base_currency.startswith('/'):
+                # Format like /USDT (e.g., for cryptocom)
+                usdt_pairs = [m['symbol'] for m in markets if m['symbol'].endswith(self.base_currency)]
+            else:
+                # Format like USDT (e.g., for binance)
+                usdt_pairs = [m['symbol'] for m in markets if m['quote'] == self.base_currency]
+            
+            # If we couldn't find pairs with the above method, try a more general approach
+            if not usdt_pairs:
+                usdt_pairs = [m['symbol'] for m in markets if 'USDT' in m['symbol']]
+            
+            if not usdt_pairs:
+                raise ValueError(f"No USDT pairs found for {self.exchange.id}")
+                
+            # Try to get volume data for sorting
+            try:
+                with self.api_lock:
+                    tickers = self.exchange.fetch_tickers(usdt_pairs[:min(50, len(usdt_pairs))])
+                    time.sleep(1)
+                
+                # Sort by volume if available
+                sorted_pairs = sorted(
+                    [symbol for symbol in tickers.keys()],
+                    key=lambda x: float(tickers[x].get('quoteVolume', 0) or 0),
+                    reverse=True
+                )
+            except Exception as e:
+                print(f"Error fetching tickers: {e}, using unsorted pairs")
+                sorted_pairs = usdt_pairs
+                
+            return sorted_pairs[:limit]
+        except Exception as e:
+            print(f"Error in get_top_symbols: {e}")
+            # Return some default common pairs as fallback
+            return ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT", "ADA/USDT"]
 
     def get_historical_data(self, symbol, interval='1h', lookback_days=270):
         try:
             timeframe = '1h'  # Using 1h timeframe as requested
             since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
-            with self.api_lock:
-                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-                time.sleep(0.5)
             
-            # For 1h timeframe, check if we have enough hourly candles
-            # Approximate 24 hours per day
-            if len(ohlcv) < lookback_days * 0.99:  # Using 22 instead of 24 to allow for missing candles
+            # Some exchanges have limits on how many candles can be fetched at once
+            # Let's fetch data in chunks to ensure we get all the data
+            all_ohlcv = []
+            current_since = since
+            max_retries = 3
+            
+            while True:
+                retries = 0
+                chunk_data = None
+                
+                # Retry mechanism for each chunk
+                while retries < max_retries and chunk_data is None:
+                    try:
+                        with self.api_lock:
+                            chunk_data = self.exchange.fetch_ohlcv(
+                                symbol, timeframe, current_since, limit=1000
+                            )
+                            time.sleep(1)  # Increased delay
+                    except Exception as e:
+                        retries += 1
+                        print(f"Retry {retries}/{max_retries} for {symbol}: {e}")
+                        time.sleep(2)  # Wait before retry
+                
+                if chunk_data is None:
+                    print(f"Failed to fetch data for {symbol} after {max_retries} retries")
+                    return None
+                
+                if not chunk_data:
+                    break
+                    
+                all_ohlcv.extend(chunk_data)
+                
+                # If we got fewer candles than requested, we've reached the end
+                if len(chunk_data) < 1000:
+                    break
+                    
+                # Update since for the next chunk (use the timestamp of the last candle + 1ms)
+                current_since = chunk_data[-1][0] + 1
+                
+                # Safety check - if we've fetched too many candles already, break
+                if len(all_ohlcv) > lookback_days * 24 * 2:  # twice the expected number
+                    break
+            
+            # For 1h timeframe, we need to be more lenient with data requirements
+            # Be more forgiving with hourly data - require only 8 hours per day on average
+            min_required_candles = lookback_days * 8
+            
+            if len(all_ohlcv) < min_required_candles:
+                print(f"Not enough data for {symbol}: {len(all_ohlcv)} candles, required {min_required_candles}")
                 return None
                 
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            
+            # Sort by timestamp to ensure chronological order
+            df = df.sort_values('timestamp')
+            
+            # Drop duplicates if any
+            df = df.drop_duplicates(subset=['timestamp'])
+            
             return df
         except Exception as e:
             print(f"Error fetching data for {symbol}: {e}")
@@ -135,45 +233,63 @@ class CryptoAnalyzer:
             self.progress_callback(progress)
 
     def analyze_symbols(self, lookback_days=270, required_coins=200, interval='1h'):
-        symbols = self.exchange.get_top_symbols(limit=required_coins)
+        symbols = self.exchange.get_top_symbols(limit=required_coins * 2)  # Get more symbols to account for filtering
+        if not symbols:
+            raise ValueError("No symbols returned from exchange")
+            
+        print(f"Top {len(symbols)} symbols: {symbols[:10]}...")
+        
         results = []
         processed_count = 0
         total_symbols = len(symbols)
         self.update_progress(0)
+        
         with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
-            # Process symbols in batches if necessary
-            while processed_count < required_coins and symbols:
-                batch_size = min(required_coins - processed_count, len(symbols))
-                current_batch = symbols[:batch_size]
-                symbols = symbols[batch_size:]
+            while processed_count < total_symbols and len(results) < required_coins:
+                batch_size = min(required_coins - len(results), len(symbols) - processed_count)
+                if batch_size <= 0:
+                    break
+                    
+                current_batch = symbols[processed_count:processed_count + batch_size]
                 future_to_symbol = {executor.submit(self.process_symbol, symbol, lookback_days, interval): symbol for symbol in current_batch}
+                
                 for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
                     try:
                         result = future.result()
                     except Exception as e:
-                        print(f"Error processing symbol: {e}")
+                        print(f"Error processing {symbol}: {e}")
                         result = None
-                    if result is not None:
-                        results.append(result)
+                        
                     processed_count += 1
                     progress = min(100, int((processed_count / total_symbols) * 100))
                     self.update_progress(progress)
+                    
+                    if result is not None:
+                        results.append(result)
+                        print(f"Successfully processed {symbol} ({len(results)}/{required_coins})")
+                        
                     if len(results) >= required_coins:
                         break
-                if not symbols and len(results) < required_coins:
-                    print(f"\nWarning: Only found {len(results)} valid coins with {lookback_days} days of data")
-                    break
+                        
         self.update_progress(100)
+        
+        if not results:
+            print("No valid results found")
+            return pd.DataFrame()
+            
         results_df = pd.DataFrame(results)
         if not results_df.empty:
             results_df = results_df.sort_values('percent_diff')
+            
         return results_df
 
     def process_symbol(self, symbol, lookback_days=270, interval='1h'):
         try:
             print(f"Processing {symbol}...")
             df = self.exchange.get_historical_data(symbol, interval=interval, lookback_days=lookback_days)
-            if df is None:
+            
+            if df is None or len(df) < 200:  # Need at least 200 candles for 200 EMA
                 return None
                 
             # Calculate POC
@@ -235,9 +351,21 @@ st.title("Cryptocurrency Point of Control (POC) Analyzer")
 
 # Add exchange selection
 st.sidebar.header("Exchange Configuration")
-exchange_options = ['cryptocom', 'binance', 'binanceus'] + sorted([ex for ex in ccxt.exchanges if ex != 'cryptocom'])
-# Setting cryptocom as default
-selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options, index=0)
+# Ensure cryptocom is actually in the list (some ccxt versions might not have it)
+available_exchanges = ccxt.exchanges
+if 'cryptocom' not in available_exchanges:
+    exchange_options = ['binance', 'binanceus', 'kucoin'] + sorted([ex for ex in available_exchanges 
+                                                                  if ex not in ['binance', 'binanceus', 'kucoin']])
+    default_index = 0  # Default to binance if cryptocom is not available
+else:
+    exchange_options = ['cryptocom', 'binance', 'binanceus'] + sorted([ex for ex in available_exchanges 
+                                                                     if ex not in ['cryptocom', 'binance', 'binanceus']])
+    default_index = 0  # cryptocom is first
+
+selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options, index=default_index)
+
+# Add debug toggle
+debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
 
 # API Configuration
 st.sidebar.header("API Configuration")
@@ -258,7 +386,7 @@ st.sidebar.header("Analysis Parameters")
 
 # Calculate and display the date we're going back to
 today = datetime.now().date()
-lookback_days = st.sidebar.slider("Lookback Days", min_value=30, max_value=365, value=270)
+lookback_days = st.sidebar.slider("Lookback Days", min_value=7, max_value=365, value=90)  # Reduced default
 lookback_date = today - timedelta(days=lookback_days)
 st.sidebar.text(f"Analysis from {lookback_date.strftime('%Y-%m-%d')} to {today.strftime('%Y-%m-%d')}")
 
@@ -270,8 +398,8 @@ if selected_date:
     lookback_days = (today - selected_date).days
     st.sidebar.text(f"Corresponds to {lookback_days} lookback days")
 
-num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, value=150)
-num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=2)
+num_coins = st.sidebar.slider("Number of Coins", min_value=5, max_value=100, value=20)  # Reduced defaults
+num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=2)  # Reduced default
 
 # Main content
 st.write("""
@@ -280,11 +408,18 @@ for each trading pair using 1-hour timeframe data. It also calculates the 200 EM
 for comparison. Only coins with complete historical data for the specified period are included.
 """)
 
+st.info("""
+**Tip**: Start with a smaller lookback period (7-30 days) and fewer coins (5-10) to test if 
+the exchange API is working properly. If you get "No results found", try changing the exchange
+or reducing the lookback period further.
+""")
+
 # Run analysis
 if st.button("Run Analysis"):
     try:
         progress_bar = st.progress(0)
         status_text = st.empty()
+        debug_info = st.empty()
 
         def update_progress(progress):
             progress_bar.progress(progress / 100)
@@ -307,13 +442,26 @@ if st.button("Run Analysis"):
         analyzer.set_progress_callback(update_progress)
 
         start_time = time.time()
-        status_text.text("Starting analysis...")
+        status_text.text(f"Starting analysis with {selected_exchange} exchange...")
+        
         # Use 1h timeframe for analysis
         results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins, interval='1h')
         execution_time = time.time() - start_time
         status_text.text(f"Analysis completed in {execution_time:.2f} seconds")
 
-        if not results.empty:
+        if debug_mode:
+            debug_info.code("Debug information is enabled. Check your terminal/console for detailed logs.")
+
+        if results.empty:
+            st.error("""
+            No results found. Please try the following:
+            1. Reduce the lookback period (try 7-14 days)
+            2. Reduce the number of coins (try 5-10)
+            3. Try a different exchange (Binance or KuCoin often work well)
+            4. Check if your API keys are correct (if using)
+            """)
+        else:
+            st.success(f"Successfully analyzed {len(results)} cryptocurrencies!")
             st.header("Results")
             display_df = results[
                 ['symbol', 'current_price', 'poc', 'percent_diff', 'ema_200', 'ema_percent_diff', 'price_category']
@@ -365,8 +513,6 @@ if st.button("Run Analysis"):
                 st.metric("Avg EMA Diff", f"{results['ema_percent_diff'].mean():.2f}%")
             with col4:
                 st.metric("Most Undervalued (EMA)", f"{results['ema_percent_diff'].min():.2f}%")
-        else:
-            st.error("No results found. Try adjusting the parameters.")
     except BinanceAPIException as e:
         st.error(f"Binance API Error: {str(e)}")
         if "Invalid API-key" in str(e):
@@ -375,3 +521,5 @@ if st.button("Run Analysis"):
             )
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
+        if debug_mode:
+            st.exception(e)
