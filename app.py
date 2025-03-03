@@ -29,7 +29,7 @@ class ExchangeAdapter:
     def get_top_symbols(self, limit=200):
         raise NotImplementedError
 
-    def get_historical_data(self, symbol, interval='1h', lookback_days=270):
+    def get_historical_data(self, symbol, interval='1d', lookback_days=270):
         raise NotImplementedError
 
 class BinanceAdapter(ExchangeAdapter):
@@ -47,7 +47,7 @@ class BinanceAdapter(ExchangeAdapter):
         # Multiply limit by 2 to allow filtering later
         return [pair['symbol'] for pair in sorted_pairs[:limit * 2]]
 
-    def get_historical_data(self, symbol, interval='1h', lookback_days=270):
+    def get_historical_data(self, symbol, interval='1d', lookback_days=270):
         try:
             start_time = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
             with self.api_lock:
@@ -59,10 +59,10 @@ class BinanceAdapter(ExchangeAdapter):
                 )
                 time.sleep(0.5)
             
-            # For 1h timeframe, we need to be more lenient with data requirements
-            # With 24 hours per day, we need approximately 24 * lookback_days candles
-            # But let's be more lenient and require at least 22 hours per day
-            min_required_candles = lookback_days * 22
+            # For 1d timeframe, we need 98% of the expected candles
+            # With a perfect dataset, we expect 1 candle per day
+            expected_candles = lookback_days
+            min_required_candles = int(expected_candles * 0.98)  # Changed from 95% to 98%
             
             if len(klines) < min_required_candles:
                 print(f"Not enough data for {symbol}: {len(klines)} candles, required {min_required_candles}")
@@ -149,9 +149,12 @@ class CCXTAdapter(ExchangeAdapter):
             # Return some default common pairs as fallback
             return ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT", "ADA/USDT"]
 
-    def get_historical_data(self, symbol, interval='1h', lookback_days=270):
+    def get_historical_data(self, symbol, interval='1d', lookback_days=270):
         try:
-            timeframe = '1h'  # Using 1h timeframe as requested
+            # Map interval to CCXT timeframe
+            timeframe_map = {'1d': '1d', '1h': '1h', '1m': '1m'}
+            timeframe = timeframe_map.get(interval, '1d')
+            
             since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
             
             # Some exchanges have limits on how many candles can be fetched at once
@@ -194,12 +197,12 @@ class CCXTAdapter(ExchangeAdapter):
                 current_since = chunk_data[-1][0] + 1
                 
                 # Safety check - if we've fetched too many candles already, break
-                if len(all_ohlcv) > lookback_days * 24 * 2:  # twice the expected number
+                if len(all_ohlcv) > lookback_days * 2:  # twice the expected number for daily
                     break
             
-            # For 1h timeframe, we need to be more lenient with data requirements
-            # Be more forgiving with hourly data - require only 8 hours per day on average
-            min_required_candles = lookback_days * 8
+            # For 1d timeframe, require 98% of expected candles
+            expected_candles = lookback_days
+            min_required_candles = int(expected_candles * 0.98)  # Changed from 95% to 98%
             
             if len(all_ohlcv) < min_required_candles:
                 print(f"Not enough data for {symbol}: {len(all_ohlcv)} candles, required {min_required_candles}")
@@ -232,7 +235,7 @@ class CryptoAnalyzer:
         if self.progress_callback:
             self.progress_callback(progress)
 
-    def analyze_symbols(self, lookback_days=270, required_coins=200, interval='1h'):
+    def analyze_symbols(self, lookback_days=270, required_coins=150, interval='1d'):
         symbols = self.exchange.get_top_symbols(limit=required_coins * 2)  # Get more symbols to account for filtering
         if not symbols:
             raise ValueError("No symbols returned from exchange")
@@ -284,7 +287,7 @@ class CryptoAnalyzer:
             
         return results_df
 
-    def process_symbol(self, symbol, lookback_days=270, interval='1h'):
+    def process_symbol(self, symbol, lookback_days=270, interval='1d'):
         try:
             print(f"Processing {symbol}...")
             df = self.exchange.get_historical_data(symbol, interval=interval, lookback_days=lookback_days)
@@ -301,9 +304,20 @@ class CryptoAnalyzer:
             df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
             current_ema = df['ema_200'].iloc[-1]
             
+            # Calculate VWAP over the entire period
+            df = self.calculate_vwap(df)
+            current_vwap = df['vwap'].iloc[-1]
+            
             current_price = float(df['close'].iloc[-1])
             percent_diff = ((current_price - poc) / poc) * 100
             ema_percent_diff = ((current_price - current_ema) / current_ema) * 100
+            vwap_percent_diff = ((current_price - current_vwap) / current_vwap) * 100
+            
+            # Calculate entry price based on strategy
+            entry_price, strategy_signal = self.calculate_entry_price(
+                current_price, poc, current_ema, current_vwap, 
+                percent_diff, ema_percent_diff, vwap_percent_diff
+            )
             
             return {
                 'symbol': symbol,
@@ -312,12 +326,73 @@ class CryptoAnalyzer:
                 'percent_diff': percent_diff,
                 'ema_200': current_ema,
                 'ema_percent_diff': ema_percent_diff,
+                'vwap': current_vwap,
+                'vwap_percent_diff': vwap_percent_diff,
+                'entry_price': entry_price,
+                'signal': strategy_signal,
                 'volume_24h': float(df['volume'].iloc[-1]),
                 'price_category': 'High' if current_price >= 100 else 'Mid' if current_price >= 1 else 'Low'
             }
         except Exception as e:
             print(f"Error analyzing {symbol}: {e}")
             return None
+
+    def calculate_vwap(self, df):
+        """Calculate Volume Weighted Average Price (VWAP)"""
+        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+        df['volume_price'] = df['typical_price'] * df['volume']
+        
+        df['cum_volume'] = df['volume'].cumsum()
+        df['cum_volume_price'] = df['volume_price'].cumsum()
+        
+        # Calculate VWAP
+        df['vwap'] = df['cum_volume_price'] / df['cum_volume']
+        
+        return df
+
+    def calculate_entry_price(self, current_price, poc, ema_200, vwap, 
+                             poc_diff, ema_diff, vwap_diff):
+        """
+        Calculate optimal entry price based on POC, EMA 200, and VWAP.
+        
+        Strategy logic:
+        1. If price is below all indicators (POC, EMA 200, VWAP), it's potentially undervalued
+           - Entry = Current Price (immediate entry)
+        2. If price is below 2 out of 3 indicators, calculate weighted target
+           - Entry = Average of the 2 lower indicators
+        3. If price is below 1 out of 3 indicators, more conservative entry
+           - Entry = The lowest indicator minus small buffer
+        4. If price is above all indicators, wait for pullback
+           - Entry = Highest of the three indicators
+        """
+        # Sort indicators from lowest to highest
+        indicators = sorted([(poc, "POC"), (ema_200, "EMA"), (vwap, "VWAP")])
+        lowest_indicator, lowest_name = indicators[0]
+        middle_indicator, middle_name = indicators[1]
+        highest_indicator, highest_name = indicators[2]
+        
+        # Determine how many indicators price is below
+        below_count = sum(1 for ind, _ in indicators if current_price < ind)
+        
+        if below_count == 3:  # Price below all indicators
+            # Immediate entry, price is undervalued
+            return current_price, "Strong Buy - Price below all indicators"
+            
+        elif below_count == 2:  # Price below 2 indicators
+            # Average of the two lower indicators for entry
+            target_entry = (lowest_indicator + middle_indicator) / 2
+            return target_entry, f"Buy - Price below {lowest_name} and {middle_name}"
+            
+        elif below_count == 1:  # Price below 1 indicator
+            # Entry at lowest indicator with 1% buffer
+            buffer = lowest_indicator * 0.01  # 1% buffer
+            target_entry = lowest_indicator - buffer
+            return target_entry, f"Cautious Buy - Wait for pullback to {lowest_name}"
+            
+        else:  # Price above all indicators
+            # Wait for pullback to highest indicator
+            target_entry = highest_indicator
+            return target_entry, "Wait - Price above all indicators"
 
     def get_appropriate_bins(self, price):
         if price >= 100:
@@ -346,8 +421,8 @@ class CryptoAnalyzer:
         return poc_price
 
 # Streamlit interface
-st.set_page_config(page_title="Crypto POC Analyzer", layout="wide")
-st.title("Cryptocurrency Point of Control (POC) Analyzer")
+st.set_page_config(page_title="Crypto POC Analyzer with VWAP", layout="wide")
+st.title("Cryptocurrency Point of Control (POC), EMA 200, and VWAP Analyzer")
 
 # Add exchange selection
 st.sidebar.header("Exchange Configuration")
@@ -386,7 +461,7 @@ st.sidebar.header("Analysis Parameters")
 
 # Calculate and display the date we're going back to
 today = datetime.now().date()
-lookback_days = st.sidebar.slider("Lookback Days", min_value=7, max_value=365, value=90)  # Reduced default
+lookback_days = st.sidebar.slider("Lookback Days", min_value=7, max_value=365, value=270)  # Changed to 270 default
 lookback_date = today - timedelta(days=lookback_days)
 st.sidebar.text(f"Analysis from {lookback_date.strftime('%Y-%m-%d')} to {today.strftime('%Y-%m-%d')}")
 
@@ -398,20 +473,25 @@ if selected_date:
     lookback_days = (today - selected_date).days
     st.sidebar.text(f"Corresponds to {lookback_days} lookback days")
 
-num_coins = st.sidebar.slider("Number of Coins", min_value=5, max_value=100, value=20)  # Reduced defaults
-num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=2)  # Reduced default
+num_coins = st.sidebar.slider("Number of Coins", min_value=5, max_value=200, value=150)  # Changed to 150 default
+num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=4)  # Changed to 4 default
+
+# Interval selection
+interval = st.sidebar.radio("Timeframe", options=["1d"], index=0)  # Only daily timeframe option
 
 # Main content
 st.write("""
-This tool analyzes cryptocurrency prices and calculates the Point of Control (POC) 
-for each trading pair using 1-hour timeframe data. It also calculates the 200 EMA 
-for comparison. Only coins with complete historical data for the specified period are included.
+This tool analyzes cryptocurrency prices and calculates the Point of Control (POC), 
+200 EMA, and VWAP for each trading pair. It uses these three indicators to suggest optimal 
+entry points for spot trading. Only coins with at least 98% of historical data for the 
+specified period are included.
 """)
 
 st.info("""
-**Tip**: Start with a smaller lookback period (7-30 days) and fewer coins (5-10) to test if 
-the exchange API is working properly. If you get "No results found", try changing the exchange
-or reducing the lookback period further.
+**Trading Strategy**: The tool identifies optimal entry points based on the relationship between 
+current price, POC, 200 EMA, and VWAP. When price is below all three indicators, it suggests an 
+immediate entry. When price is above all indicators, it suggests waiting for a pullback to the 
+highest indicator level.
 """)
 
 # Run analysis
@@ -444,8 +524,7 @@ if st.button("Run Analysis"):
         start_time = time.time()
         status_text.text(f"Starting analysis with {selected_exchange} exchange...")
         
-        # Use 1h timeframe for analysis
-        results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins, interval='1h')
+        results = analyzer.analyze_symbols(lookback_days=lookback_days, required_coins=num_coins, interval=interval)
         execution_time = time.time() - start_time
         status_text.text(f"Analysis completed in {execution_time:.2f} seconds")
 
@@ -464,21 +543,27 @@ if st.button("Run Analysis"):
             st.success(f"Successfully analyzed {len(results)} cryptocurrencies!")
             st.header("Results")
             display_df = results[
-                ['symbol', 'current_price', 'poc', 'percent_diff', 'ema_200', 'ema_percent_diff', 'price_category']
+                ['symbol', 'current_price', 'poc', 'percent_diff', 'ema_200', 'ema_percent_diff', 
+                 'vwap', 'vwap_percent_diff', 'entry_price', 'signal', 'price_category']
             ]
             display_df = display_df.round({
                 'current_price': 4,
                 'poc': 4,
                 'percent_diff': 2,
                 'ema_200': 4,
-                'ema_percent_diff': 2
+                'ema_percent_diff': 2,
+                'vwap': 4,
+                'vwap_percent_diff': 2,
+                'entry_price': 4
             })
             
             # Rename columns for better clarity
             display_df = display_df.rename(columns={
                 'percent_diff': 'POC Diff %',
                 'ema_percent_diff': 'EMA Diff %',
-                'ema_200': '200 EMA'
+                'vwap_percent_diff': 'VWAP Diff %',
+                'ema_200': '200 EMA',
+                'entry_price': 'Entry Price'
             })
 
             def highlight_diff(val):
@@ -486,10 +571,23 @@ if st.button("Run Analysis"):
                     color = 'red' if val < 0 else 'green'
                     return f'color: {color}'
                 return ''
+                
+            def highlight_signal(val):
+                if isinstance(val, str):
+                    if "Strong Buy" in val:
+                        return 'background-color: lightgreen'
+                    elif "Buy" in val:
+                        return 'background-color: #e6ffe6'  # Very light green
+                    elif "Wait" in val:
+                        return 'background-color: #ffe6e6'  # Very light red
+                return ''
 
             styled_df = display_df.style.applymap(
                 highlight_diff,
-                subset=['POC Diff %', 'EMA Diff %']
+                subset=['POC Diff %', 'EMA Diff %', 'VWAP Diff %']
+            ).applymap(
+                highlight_signal,
+                subset=['signal']
             )
 
             st.dataframe(styled_df, use_container_width=True)
@@ -502,17 +600,53 @@ if st.button("Run Analysis"):
                 mime="text/csv"
             )
 
+            st.header("Strategy Overview")
+            st.write("""
+            ### Entry Price Strategy Explanation
+            
+            The analysis uses a multi-layered strategy to determine optimal entry points based on 3 key indicators:
+            
+            1. **Point of Control (POC)**: The price level with the highest historical trading volume
+            2. **200-day EMA**: Long-term trend indicator
+            3. **VWAP (Volume Weighted Average Price)**: Represents the fair value based on both price and volume
+            
+            #### Entry Strategy Logic:
+            
+            - **Strong Buy Signal**: When current price is below all three indicators (POC, EMA 200, VWAP), suggesting the asset is potentially undervalued across all metrics. The entry is immediate at current price.
+            
+            - **Buy Signal**: When price is below two indicators but above one. Entry price is calculated as the average of the two lower indicators, providing a balanced entry point.
+            
+            - **Cautious Buy Signal**: When price is below only one indicator. Entry is suggested slightly below that indicator (with a 1% buffer) to catch potential pullbacks.
+            
+            - **Wait Signal**: When price is above all indicators, suggesting the asset may be overvalued. The entry is set at the highest indicator level to wait for a significant pullback.
+            
+            This strategy aims to provide optimal entries by balancing technical indicators that represent historical trading patterns (POC), long-term trends (EMA 200), and fair value based on recent volume (VWAP).
+            """)
+
             st.header("Summary Statistics")
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
 
             with col1:
+                st.subheader("POC Analysis")
                 st.metric("Avg POC Diff", f"{results['percent_diff'].mean():.2f}%")
-            with col2:
                 st.metric("Most Undervalued (POC)", f"{results['percent_diff'].min():.2f}%")
-            with col3:
+                
+            with col2:
+                st.subheader("EMA Analysis")
                 st.metric("Avg EMA Diff", f"{results['ema_percent_diff'].mean():.2f}%")
-            with col4:
                 st.metric("Most Undervalued (EMA)", f"{results['ema_percent_diff'].min():.2f}%")
+                
+            with col3:
+                st.subheader("VWAP Analysis")
+                st.metric("Avg VWAP Diff", f"{results['vwap_percent_diff'].mean():.2f}%")
+                st.metric("Most Undervalued (VWAP)", f"{results['vwap_percent_diff'].min():.2f}%")
+                
+            # Count signals by type
+            signal_counts = results['signal'].str.extract(r'(Strong Buy|Buy|Cautious Buy|Wait)')[0].value_counts()
+            
+            st.subheader("Signal Distribution")
+            st.bar_chart(signal_counts)
+
     except BinanceAPIException as e:
         st.error(f"Binance API Error: {str(e)}")
         if "Invalid API-key" in str(e):
