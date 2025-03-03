@@ -342,7 +342,7 @@ num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, va
 num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=4)
 
 # Interval selection
-interval = st.sidebar.radio("Timeframe", options=["1d, 4H"], index=0)  # Only daily timeframe option
+interval = st.sidebar.radio("Timeframe", options=["1d"], index=0)  # Only daily timeframe option
 
 # Main content
 st.write("""
