@@ -347,7 +347,7 @@ if st.button("Run Analysis"):
             )
 
             st.header("Summary Statistics")
-            col1, col2, col3, col4 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
             with col1:
                 st.metric("Avg POC Diff", f"{results['percent_diff'].mean():.2f}%")
