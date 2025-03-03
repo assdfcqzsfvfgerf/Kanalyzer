@@ -308,9 +308,9 @@ selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options, in
 debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
 
 # API Configuration
-# st.sidebar.header("API Configuration")
-# api_key = st.sidebar.text_input("API Key", type="password")
-# api_secret = st.sidebar.text_input("API Secret", type="password")
+st.sidebar.header("API Configuration")
+api_key = st.sidebar.text_input("API Key", type="password")
+api_secret = st.sidebar.text_input("API Secret", type="password")
 
 # Save configuration in session state
 if 'api_configured' not in st.session_state:
