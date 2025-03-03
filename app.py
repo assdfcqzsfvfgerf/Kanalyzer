@@ -174,8 +174,14 @@ class CryptoAnalyzer:
             poc = self.calculate_poc(df)
             if poc is None:
                 return None
+            
+            df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+            current_ema = df['ema_200'].iloc[-1]
+            
             current_price = float(df['close'].iloc[-1])
             percent_diff = ((current_price - poc) / poc) * 100
+            ema_percent_diff = ((current_price - current_ema) / current_ema) * 100
+            
             return {
                 'symbol': symbol,
                 'current_price': current_price,
@@ -221,8 +227,9 @@ st.title("Cryptocurrency Point of Control (POC) Analyzer")
 
 # Add exchange selection
 st.sidebar.header("Exchange Configuration")
-exchange_options = ['binance', 'binanceus'] + sorted(ccxt.exchanges)
-selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options)
+exchange_options = ['cryptocom', 'binance', 'binanceus'] + sorted([ex for ex in ccxt.exchanges if ex != 'cryptocom'])
+# Setting cryptocom as default
+selected_exchange = st.sidebar.selectbox("Select Exchange", exchange_options, index=0)
 
 # API Configuration
 st.sidebar.header("API Configuration")
@@ -240,14 +247,29 @@ if api_key and api_secret:
 
 # Analysis parameters
 st.sidebar.header("Analysis Parameters")
+
+# Calculate and display the date we're going back to
+today = datetime.now().date()
 lookback_days = st.sidebar.slider("Lookback Days", min_value=30, max_value=365, value=270)
-num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, value=50)
+lookback_date = today - timedelta(days=lookback_days)
+st.sidebar.text(f"Analysis from {lookback_date.strftime('%Y-%m-%d')} to {today.strftime('%Y-%m-%d')}")
+
+# Add date selection via calendar
+st.sidebar.subheader("Or select specific start date:")
+selected_date = st.sidebar.date_input("Start Date", value=lookback_date, max_value=today - timedelta(days=1))
+# Recalculate lookback days if date is selected
+if selected_date:
+    lookback_days = (today - selected_date).days
+    st.sidebar.text(f"Corresponds to {lookback_days} lookback days")
+
+num_coins = st.sidebar.slider("Number of Coins", min_value=10, max_value=200, value=150)
 num_threads = st.sidebar.slider("Number of Threads", min_value=1, max_value=8, value=4)
 
 # Main content
 st.write("""
 This tool analyzes cryptocurrency prices and calculates the Point of Control (POC) 
-for each trading pair. It only includes coins with complete historical data for the specified period.
+for each trading pair using 1-hour timeframe data. It also calculates the 200 EMA 
+for comparison. Only coins with complete historical data for the specified period are included.
 """)
 
 # Run analysis
@@ -290,18 +312,27 @@ if st.button("Run Analysis"):
             display_df = display_df.round({
                 'current_price': 4,
                 'poc': 4,
-                'percent_diff': 2
+                'percent_diff': 2,
+                'ema_200': 4,
+                'ema_percent_diff': 2
             })
-
-            def highlight_percent_diff(val):
+            
+            # Rename columns for better clarity
+            display_df = display_df.rename(columns={
+                'percent_diff': 'POC Diff %',
+                'ema_percent_diff': 'EMA Diff %',
+                'ema_200': '200 EMA'
+            })
+            
+            def highlight_diff(val):
                 if isinstance(val, float):
                     color = 'red' if val < 0 else 'green'
                     return f'color: {color}'
                 return ''
 
             styled_df = display_df.style.applymap(
-                highlight_percent_diff,
-                subset=['percent_diff']
+                highlight_diff,
+                subset=['POC Diff %', 'EMA Diff %']
             )
 
             st.dataframe(styled_df, use_container_width=True)
@@ -318,11 +349,13 @@ if st.button("Run Analysis"):
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                st.metric("Average % Difference", f"{results['percent_diff'].mean():.2f}%")
+                st.metric("Avg POC Diff", f"{results['percent_diff'].mean():.2f}%")
             with col2:
-                st.metric("Most Undervalued", f"{results['percent_diff'].min():.2f}%")
+                st.metric("Most Undervalued (POC)", f"{results['percent_diff'].min():.2f}%")
             with col3:
-                st.metric("Most Overvalued", f"{results['percent_diff'].max():.2f}%")
+                st.metric("Avg EMA Diff", f"{results['ema_percent_diff'].mean():.2f}%")
+            with col4:
+                st.metric("Most Undervalued (EMA)", f"{results['ema_percent_diff'].min():.2f}%")
         else:
             st.error("No results found. Try adjusting the parameters.")
     except BinanceAPIException as e:
